@@ -1,19 +1,17 @@
 # PIMM (Pi-SCF-Molecular-Mechanics) Python Rewrite
-# Version 2.0 - Implemented Correct and Stable Geometry Optimizer
+# Version 3.0 - Final Version with SciPy Professional Optimizer
 
 import numpy as np
 import argparse
 import sys
+from scipy.optimize import minimize
 
 # --- Force Field Parameter Database ---
 BOND_PARAMETERS = {
     (6, 6): (1.53, 20.0), (1, 6): (1.10, 34.0),
 }
 ANGLE_PARAMETERS = {
-    # Key: (end_atom1_num, center_atom_num, end_atom2_num) with end atoms sorted
-    (1, 6, 1): (109.5, 30.0),  # H-C-H
-    (1, 6, 6): (109.5, 35.0),  # H-C-C
-    (6, 6, 6): (109.5, 40.0),  # C-C-C
+    (1, 6, 1): (109.5, 30.0), (1, 6, 6): (109.5, 35.0), (6, 6, 6): (109.5, 40.0),
 }
 TORSION_PARAMETERS = {
     (None, 6, 6, None): (0.008, 3, 0),
@@ -76,122 +74,141 @@ class CalculationJob:
     def add_atom(self, atom): self.atoms.append(atom)
 
 
-# --- Force and Energy Calculation Functions ---
-def calculate_energies_and_forces(job, current_coords):
-    """Calculates all energies and forces for a given set of coordinates."""
-    num_atoms = len(job.atoms)
-    job.forces = np.zeros((num_atoms, 3))
-
-    # Use the provided coordinates to calculate the distance matrix
-    job.distance_matrix = np.linalg.norm(current_coords[:, np.newaxis, :] - current_coords[np.newaxis, :, :], axis=2)
-
-    job.energies = {}
+# --- Energy Calculation Function ---
+def calculate_energy(coords_flat, job):
+    """Calculate energy for given coordinates."""
+    coords = coords_flat.reshape((len(job.atoms), 3))
+    distance_matrix = np.linalg.norm(coords[:, np.newaxis, :] - coords[np.newaxis, :, :], axis=2)
     total_energy = 0.0
 
-    # Bond Energy and Forces
-    bond_energy = 0.0
+    # Bond Energy
     for i, j in job.bonds:
         params = BOND_PARAMETERS.get(tuple(sorted((job.atoms[i].atomic_num, job.atoms[j].atomic_num))))
         if params:
-            r0, k = params;
-            r = job.distance_matrix[i, j];
-            if r < 1e-6: continue
-            vec_ij = current_coords[i] - current_coords[j]
-            force_magnitude = 2 * k * (r - r0)
-            force_vector = force_magnitude * (vec_ij / r)
-            job.forces[i] -= force_vector;
-            job.forces[j] += force_vector
-            bond_energy += k * (r - r0) ** 2
-    job.energies['bond_stretching'] = bond_energy
-    total_energy += bond_energy
+            r0, k = params
+            r = distance_matrix[i, j]
+            if r > 1e-6:
+                total_energy += k * (r - r0) ** 2
 
-    # Angle Energy and Forces
-    angle_energy = 0.0
+    # Angle Energy
     for k_idx, i_idx, j_idx in job.angles:
-        # ** FIX: Implemented robust key for angle parameters **
         atom_nums = (job.atoms[k_idx].atomic_num, job.atoms[j_idx].atomic_num)
         angle_type = (min(atom_nums), job.atoms[i_idx].atomic_num, max(atom_nums))
         params = ANGLE_PARAMETERS.get(angle_type)
-
         if params:
-            theta0_deg, k_angle = params;
+            theta0_deg, k_angle = params
             theta0_rad = np.deg2rad(theta0_deg)
-            v_ik = current_coords[k_idx] - current_coords[i_idx];
-            v_ij = current_coords[j_idx] - current_coords[i_idx]
-            r_ik = np.linalg.norm(v_ik);
+            v_ik = coords[k_idx] - coords[i_idx]
+            v_ij = coords[j_idx] - coords[i_idx]
+            r_ik = np.linalg.norm(v_ik)
             r_ij = np.linalg.norm(v_ij)
-            if r_ik < 1e-6 or r_ij < 1e-6: continue
-            cos_theta = np.dot(v_ik, v_ij) / (r_ik * r_ij)
-            theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))
-            if np.sin(theta) < 1e-6: continue
-            force_magnitude = -2 * k_angle * (theta - theta0_rad)
-            force_k = (force_magnitude / (r_ik * np.sin(theta))) * (v_ij / r_ij - cos_theta * v_ik / r_ik)
-            force_j = (force_magnitude / (r_ij * np.sin(theta))) * (v_ik / r_ik - cos_theta * v_ij / r_ij)
-            job.forces[k_idx] += force_k;
-            job.forces[j_idx] += force_j;
-            job.forces[i_idx] -= (force_k + force_j)
-            angle_energy += k_angle * (theta - theta0_rad) ** 2
-    job.energies['angle_bending'] = angle_energy
-    total_energy += angle_energy
+            if r_ik > 1e-6 and r_ij > 1e-6:
+                cos_theta = np.dot(v_ik, v_ij) / (r_ik * r_ij)
+                cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                theta = np.arccos(cos_theta)
+                total_energy += k_angle * (theta - theta0_rad) ** 2
 
     return total_energy
 
 
+# --- Force Calculation Function ---
+def calculate_forces(coords_flat, job):
+    """Calculate forces for given coordinates."""
+    coords = coords_flat.reshape((len(job.atoms), 3))
+    forces = np.zeros_like(coords)
+    distance_matrix = np.linalg.norm(coords[:, np.newaxis, :] - coords[np.newaxis, :, :], axis=2)
+
+    # Bond Forces
+    for i, j in job.bonds:
+        params = BOND_PARAMETERS.get(tuple(sorted((job.atoms[i].atomic_num, job.atoms[j].atomic_num))))
+        if params:
+            r0, k = params
+            r = distance_matrix[i, j]
+            if r > 1e-6:
+                vec_ij = coords[i] - coords[j]
+                force_magnitude = 2 * k * (r - r0)
+                force_vector = force_magnitude * (vec_ij / r)
+                forces[i] -= force_vector
+                forces[j] += force_vector
+
+    # Angle Forces
+    for k_idx, i_idx, j_idx in job.angles:
+        atom_nums = (job.atoms[k_idx].atomic_num, job.atoms[j_idx].atomic_num)
+        angle_type = (min(atom_nums), job.atoms[i_idx].atomic_num, max(atom_nums))
+        params = ANGLE_PARAMETERS.get(angle_type)
+        if params:
+            theta0_deg, k_angle = params
+            theta0_rad = np.deg2rad(theta0_deg)
+            v_ik = coords[k_idx] - coords[i_idx]
+            v_ij = coords[j_idx] - coords[i_idx]
+            r_ik = np.linalg.norm(v_ik)
+            r_ij = np.linalg.norm(v_ij)
+            if r_ik > 1e-6 and r_ij > 1e-6:
+                cos_theta = np.dot(v_ik, v_ij) / (r_ik * r_ij)
+                cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                theta = np.arccos(cos_theta)
+                if np.sin(theta) > 1e-6:
+                    force_magnitude = -2 * k_angle * (theta - theta0_rad)
+                    force_k = (force_magnitude / (r_ik * np.sin(theta))) * (v_ij / r_ij - cos_theta * v_ik / r_ik)
+                    force_j = (force_magnitude / (r_ij * np.sin(theta))) * (v_ik / r_ik - cos_theta * v_ij / r_ij)
+                    forces[k_idx] += force_k
+                    forces[j_idx] += force_j
+                    forces[i_idx] -= (force_k + force_j)
+
+    # Return negative forces as gradient (SciPy minimizes, so gradient = -force)
+    return -forces.flatten()
+
+
+# --- Main Program Functions ---
 def run_geometry_optimization(job):
-    """Performs geometry optimization with a stable optimizer."""
+    """Performs geometry optimization using SciPy's L-BFGS-B algorithm."""
     print(f"--- Running Geometry Optimization for: {job.title.strip()} ---")
 
-    step_size = 0.001  # Start with a smaller, safer step size
-    force_threshold = 0.01
+    initial_coords = np.array([atom.coords for atom in job.atoms]).flatten()
 
-    # This is the master copy of the coordinates for the optimizer
-    coords = np.array([atom.coords for atom in job.atoms])
+    # Calculate initial energy and forces for reporting
+    initial_energy = calculate_energy(initial_coords, job)
+    initial_forces = -calculate_forces(initial_coords, job)  # Convert gradient back to forces
+    max_force = np.max(np.abs(initial_forces))
 
-    for cycle in range(job.options.igeo):
+    print(f"Initial Energy: {initial_energy:.6f} eV")
+    print(f"Initial Max Force: {max_force:.6f} eV/Å")
 
-        # Calculate forces and energy at the current, accepted position
-        current_energy = calculate_energies_and_forces(job, coords)
-        max_force = np.max(np.linalg.norm(job.forces, axis=1))
+    # Run the optimization
+    result = minimize(
+        fun=calculate_energy,
+        x0=initial_coords,
+        args=(job,),
+        method='L-BFGS-B',
+        jac=calculate_forces,
+        options={
+            'disp': False,
+            'gtol': 1e-4,
+            'ftol': 1e-9,
+            'maxiter': 1000
+        }
+    )
 
-        print(f"  Cycle {cycle + 1: >3}: Total Energy = {current_energy:.4f} eV, Max Force = {max_force:.4f} eV/Å")
+    if result.success:
+        print(f"--- Optimization Converged Successfully ---")
+        print(f"Final Energy: {result.fun:.6f} eV")
+        print(f"Function evaluations: {result.nfev}")
+        print(f"Gradient evaluations: {result.njev}")
 
-        if max_force < force_threshold:
-            print("--- Optimization Converged ---")
-            break
+        # Update atom coordinates
+        final_coords = result.x.reshape((len(job.atoms), 3))
+        for i, atom in enumerate(job.atoms):
+            atom.coords = final_coords[i]
 
-        # Propose a new set of coordinates by moving along the force vector
-        # Force is the negative gradient, so adding the force moves us "downhill"
-        displacement = step_size * job.forces
-        proposed_coords = coords + displacement
+        # Calculate final forces for reporting
+        final_forces = -calculate_forces(result.x, job)
+        max_final_force = np.max(np.abs(final_forces))
+        print(f"Final Max Force: {max_final_force:.6f} eV/Å")
 
-        # Diagnostic print statement as requested
-        print(f"    Displacement on atom 1 = {np.linalg.norm(displacement[0]):.6f} Å")
-
-        # Calculate energy at the new trial position
-        trial_energy = calculate_energies_and_forces(job, proposed_coords)
-
-        if trial_energy < current_energy:
-            # Good step: accept the new coordinates as the master copy
-            coords = proposed_coords
-            step_size = min(step_size * 1.1, 0.005)  # Gently increase step size
-        else:
-            # Bad step: reject the new coordinates and reduce step size
-            print("  Energy increased. Rejecting step and reducing step size.")
-            # The 'coords' variable remains unchanged, holding the last good position.
-            step_size *= 0.5
-
-    else:  # This 'else' belongs to the for loop, runs if loop isn't broken
-        print("--- Optimization finished (max cycles reached) ---")
-
-    # After optimization, update the atom objects with the final, best coordinates
-    for i, atom in enumerate(job.atoms):
-        atom.coords = coords[i]
-
-
-# --- Setup and Main Execution ---
-def assign_temporary_charges(job):
-    # This is a placeholder. A real implementation would involve an iterative SCF calculation.
-    pass  # Charges are not used in this simplified version
+    else:
+        print(f"--- Optimization Failed ---")
+        print(f"Message: {result.message}")
+        print(f"Status: {result.status}")
 
 
 def setup_geometry(job):
@@ -282,9 +299,7 @@ def main():
     for i, job in enumerate(calculation_jobs):
         print(f"\n===== Starting Job {i + 1} =====")
         setup_geometry(job)
-        # assign_temporary_charges(job) # Temporarily disabled for this simple example
         run_geometry_optimization(job)
-        # Final property calculation and output would go here, after optimization
         print(f"===== Finished Job {i + 1} =====")
 
 
